@@ -8,11 +8,14 @@ using System.Windows;
 using System.Windows.Forms;
 using Application = System.Windows.Application;
 using System.Drawing;
+using System.Reflection;
+using System.IO;
 
 namespace Killbot
 {
     public partial class App : Application
     {
+        private const string Killbot = "Killbot";
         private NotifyIcon _notifyIcon;
         private bool _isMonitoring = true;
         private Thread _monitorThread;
@@ -26,25 +29,58 @@ namespace Killbot
             public ToolStripMenuItem MenuItem { get; set; }
         }
 
+        private Icon LoadIconFromResource()
+        {
+            try
+            {
+                EventLog.WriteEntry(Killbot, "Attempting to load application icon...", EventLogEntryType.Information);
+                var assembly = Assembly.GetExecutingAssembly();
+                var resourceNames = assembly.GetManifestResourceNames();
+                EventLog.WriteEntry(Killbot, $"Available resources: {string.Join(", ", resourceNames)}", EventLogEntryType.Information);
+
+                // Try to load the icon from the embedded resources
+                var stream = assembly.GetManifestResourceStream("killbot.ico");
+                if (stream != null)
+                {
+                    EventLog.WriteEntry(Killbot, "Successfully loaded icon from embedded resources", EventLogEntryType.Information);
+                    return new Icon(stream);
+                }
+
+                // If that doesn't work, try to load from the application directory
+                var iconPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "resources", "killbot.ico");
+                if (File.Exists(iconPath))
+                {
+                    EventLog.WriteEntry(Killbot, "Loading icon from application directory", EventLogEntryType.Information);
+                    return new Icon(iconPath);
+                }
+
+                EventLog.WriteEntry(Killbot, "Failed to load custom icon, using system default", EventLogEntryType.Warning);
+                return SystemIcons.Application;
+            }
+            catch (Exception ex)
+            {
+                EventLog.WriteEntry(Killbot, $"Error loading icon: {ex.Message}\nStack trace: {ex.StackTrace}", EventLogEntryType.Error);
+                return SystemIcons.Application;
+            }
+        }
+
         protected override void OnStartup(StartupEventArgs e)
         {
             try
             {
-                if (!EventLog.SourceExists("FUA"))
+                if (!EventLog.SourceExists(Killbot))
                 {
-                    EventLog.CreateEventSource("FUA", "Application");
+                    EventLog.WriteEntry("Application", "Creating new event source 'Killbot'", EventLogEntryType.Information);
+                    EventLog.CreateEventSource(Killbot, "Application");
                 }
 
-                EventLog.WriteEntry("FUA", "Service Monitor started successfully.", EventLogEntryType.Information);
-
-                // Don't call base.OnStartup as it would create the main window
                 InitializeServiceList();
                 InitializeSystemTray();
                 StartMonitoring();
             }
             catch (Exception ex)
             {
-                EventLog.WriteEntry("FUA", $"Unhandled Exception: {ex}", EventLogEntryType.Error);
+                EventLog.WriteEntry(Killbot, $"Critical startup error: {ex.Message}\nStack trace: {ex.StackTrace}", EventLogEntryType.Error);
                 System.Windows.MessageBox.Show($"Error: {ex.Message}", "Application Error", MessageBoxButton.OK, MessageBoxImage.Error);
                 Shutdown(-1);
             }
@@ -63,96 +99,119 @@ namespace Killbot
 
         private void InitializeSystemTray()
         {
-            _notifyIcon = new NotifyIcon
+            try
             {
-                Icon = new System.Drawing.Icon("resources/killbot.ico"),
-                Visible = true,
-                Text = "Service Monitor (Active)"
-            };
-
-            _contextMenu = new ContextMenuStrip();
-
-            var toggleMonitoringItem = new ToolStripMenuItem("Pause Monitoring", null, ToggleMonitoring)
-            {
-                Image = _isMonitoring ? SystemIcons.Shield.ToBitmap() : SystemIcons.Error.ToBitmap()
-            };
-            _contextMenu.Items.Add(toggleMonitoringItem);
-            _contextMenu.Items.Add(new ToolStripSeparator());
-
-            foreach (var kvp in _servicesToMonitor)
-            {
-                var serviceKey = kvp.Key;
-                var serviceInfo = kvp.Value;
-
-                var menuItem = new ToolStripMenuItem(serviceInfo.DisplayName)
+                EventLog.WriteEntry(Killbot, "Creating system tray icon...", EventLogEntryType.Information);
+                _notifyIcon = new NotifyIcon
                 {
-                    Checked = serviceInfo.IsMonitored,
-                    CheckOnClick = true,
-                    ToolTipText = GetServiceStatus(serviceKey)
+                    Icon = LoadIconFromResource(),
+                    Visible = true,
+                    Text = "Service Monitor (Active)"
                 };
 
-                menuItem.CheckedChanged += (sender, args) =>
+
+                _contextMenu = new ContextMenuStrip();
+
+                var toggleMonitoringItem = new ToolStripMenuItem("Pause Monitoring", null, ToggleMonitoring)
                 {
-                    serviceInfo.IsMonitored = menuItem.Checked;
+                    Image = _isMonitoring ? SystemIcons.Shield.ToBitmap() : SystemIcons.Error.ToBitmap()
+                };
+                _contextMenu.Items.Add(toggleMonitoringItem);
+                _contextMenu.Items.Add(new ToolStripSeparator());
+
+                foreach (var kvp in _servicesToMonitor)
+                {
+                    var serviceKey = kvp.Key;
+                    var serviceInfo = kvp.Value;
+
+                    var menuItem = new ToolStripMenuItem(serviceInfo.DisplayName)
+                    {
+                        Checked = serviceInfo.IsMonitored,
+                        CheckOnClick = true,
+                        ToolTipText = GetServiceStatus(serviceKey)
+                    };
+
+                    menuItem.CheckedChanged += (sender, args) =>
+                    {
+                        serviceInfo.IsMonitored = menuItem.Checked;
+                        UpdateServiceMenuItem(serviceKey, menuItem);
+                        EventLog.WriteEntry(Killbot, $"Service monitoring {(menuItem.Checked ? "enabled" : "disabled")} for {serviceKey}", EventLogEntryType.Information);
+                    };
+
+                    serviceInfo.MenuItem = menuItem;
+                    _contextMenu.Items.Add(menuItem);
                     UpdateServiceMenuItem(serviceKey, menuItem);
+                }
+
+                _contextMenu.Items.Add(new ToolStripSeparator());
+
+                var exitItem = new ToolStripMenuItem("Exit", null, ExitApplication);
+                _contextMenu.Items.Add(exitItem);
+
+                _notifyIcon.ContextMenuStrip = _contextMenu;
+                _notifyIcon.MouseClick += (sender, args) =>
+                {
+                    if (args.Button == MouseButtons.Left)
+                    {
+                        _contextMenu.Show(Cursor.Position);
+                    }
                 };
 
-                serviceInfo.MenuItem = menuItem;
-                _contextMenu.Items.Add(menuItem);
-                UpdateServiceMenuItem(serviceKey, menuItem);
             }
-
-            _contextMenu.Items.Add(new ToolStripSeparator());
-
-            var exitItem = new ToolStripMenuItem("Exit", null, ExitApplication);
-            _contextMenu.Items.Add(exitItem);
-
-            _notifyIcon.ContextMenuStrip = _contextMenu;
-            _notifyIcon.MouseClick += (sender, args) =>
+            catch (Exception ex)
             {
-                if (args.Button == MouseButtons.Left)
-                {
-                    _contextMenu.Show(Cursor.Position);
-                }
-            };
+                EventLog.WriteEntry(Killbot, $"Error initializing system tray: {ex.Message}\nStack trace: {ex.StackTrace}", EventLogEntryType.Error);
+                throw;
+            }
         }
 
         private void StartMonitoring()
         {
             _monitorThread = new Thread(() =>
             {
-                while (true)
+                try
                 {
-                    if (_isMonitoring)
+                    while (true)
                     {
-                        foreach (var kvp in _servicesToMonitor.Where(s => s.Value.IsMonitored))
+                        if (_isMonitoring)
                         {
-                            try
+                            foreach (var kvp in _servicesToMonitor.Where(s => s.Value.IsMonitored))
                             {
-                                var serviceController = new ServiceController(kvp.Key);
-                                if (serviceController.Status == ServiceControllerStatus.Running)
+                                try
                                 {
-                                    EventLog.WriteEntry("FUA", $"Stopping service: {kvp.Key}", EventLogEntryType.Information);
-                                    serviceController.Stop();
-                                    serviceController.WaitForStatus(ServiceControllerStatus.Stopped, TimeSpan.FromSeconds(30));
+                                    var serviceController = new ServiceController(kvp.Key);
+                                    var status = serviceController.Status;
+
+                                    if (status == ServiceControllerStatus.Running)
+                                    {
+
+                                        serviceController.Stop();
+                                        serviceController.WaitForStatus(ServiceControllerStatus.Stopped, TimeSpan.FromSeconds(30));
+
+                                    }
+                                    UpdateServiceMenuItem(kvp.Key, kvp.Value.MenuItem);
                                 }
-                                UpdateServiceMenuItem(kvp.Key, kvp.Value.MenuItem);
-                            }
-                            catch (Exception ex)
-                            {
-                                EventLog.WriteEntry("FUA", $"Error controlling service {kvp.Key}: {ex.Message}", EventLogEntryType.Error);
-                                Debug.WriteLine($"Error controlling service {kvp.Key}: {ex.Message}");
+                                catch (Exception ex)
+                                {
+                                    EventLog.WriteEntry(Killbot, $"Error controlling service {kvp.Key}: {ex.Message}\nStack trace: {ex.StackTrace}", EventLogEntryType.Error);
+                                    Debug.WriteLine($"Error controlling service {kvp.Key}: {ex.Message}");
+                                }
                             }
                         }
-                    }
 
-                    // Update service statuses in the menu
-                    foreach (var kvp in _servicesToMonitor)
-                    {
-                        UpdateServiceMenuItem(kvp.Key, kvp.Value.MenuItem);
-                    }
+                        // Update service statuses in the menu
+                        foreach (var kvp in _servicesToMonitor)
+                        {
+                            UpdateServiceMenuItem(kvp.Key, kvp.Value.MenuItem);
+                        }
 
-                    Thread.Sleep(2000);
+                        Thread.Sleep(2000);
+                    }
+                }
+                catch (Exception ex)
+                {
+                    EventLog.WriteEntry(Killbot, $"Critical error in monitoring thread: {ex.Message}\nStack trace: {ex.StackTrace}", EventLogEntryType.Error);
+                    throw;
                 }
             })
             {
@@ -188,13 +247,13 @@ namespace Killbot
             {
                 var service = new ServiceController(serviceName);
                 var status = service.Status;
-                
+
                 menuItem.ToolTipText = $"Status: {status}";
-                
+
                 // Update the menu item appearance based on status
                 if (_servicesToMonitor[serviceName].IsMonitored)
                 {
-                    menuItem.Image = status == ServiceControllerStatus.Stopped ? 
+                    menuItem.Image = status == ServiceControllerStatus.Stopped ?
                         SystemIcons.Shield.ToBitmap() : SystemIcons.Warning.ToBitmap();
                 }
                 else
@@ -220,12 +279,12 @@ namespace Killbot
                 menuItem.Image = _isMonitoring ? SystemIcons.Shield.ToBitmap() : SystemIcons.Error.ToBitmap();
             }
 
-            EventLog.WriteEntry("FUA", _isMonitoring ? "Monitoring resumed" : "Monitoring paused", EventLogEntryType.Information);
+
         }
 
         private void ExitApplication(object sender, EventArgs e)
         {
-            EventLog.WriteEntry("FUA", "Application shutting down", EventLogEntryType.Information);
+
             _notifyIcon.Visible = false;
             Shutdown();
         }
